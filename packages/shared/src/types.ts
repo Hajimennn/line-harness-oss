@@ -203,6 +203,46 @@ export interface TemplateUsages {
 }
 
 // -----------------------------------------------------------------------------
+// 承認付きグループ転送
+// -----------------------------------------------------------------------------
+
+export type GroupForwardRequestStatus = 'pending' | 'approved' | 'rejected' | 'expired' | 'failed';
+
+export interface GroupForwardRule {
+  id: string;
+  lineAccountId: string | null;
+  name: string;
+  sourceGroupId: string;
+  targetGroupId: string;
+  approverUserId: string;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GroupForwardRequest {
+  id: string;
+  approvalCode: string;
+  ruleId: string;
+  ruleName?: string | null;
+  lineAccountId: string | null;
+  sourceGroupId: string;
+  targetGroupId: string;
+  approverUserId: string;
+  sourceUserId: string | null;
+  lineMessageId: string;
+  messageText: string;
+  status: GroupForwardRequestStatus;
+  expiresAt: string;
+  approvedAt: string | null;
+  rejectedAt: string | null;
+  forwardedAt: string | null;
+  failureReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// -----------------------------------------------------------------------------
 // 友だち×シナリオ 進捗テーブル (FriendScenario)
 // -----------------------------------------------------------------------------
 

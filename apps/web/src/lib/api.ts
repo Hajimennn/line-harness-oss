@@ -32,6 +32,8 @@ import type {
   EntryRouteFunnel,
   TrafficPool,
   PoolAccount,
+  GroupForwardRule,
+  GroupForwardRequest,
 } from '@line-crm/shared'
 
 /** Broadcast type from API (now camelCase after worker serialization) */
@@ -756,6 +758,39 @@ export const api = {
         }),
       delete: (id: string) =>
         fetchApi<ApiResponse<null>>(`/api/webhooks/outgoing/${id}`, { method: 'DELETE' }),
+    },
+  },
+  groupForwarding: {
+    rules: {
+      list: (accountId?: string) => {
+        const query = accountId ? '?accountId=' + encodeURIComponent(accountId) : ''
+        return fetchApi<ApiResponse<GroupForwardRule[]>>('/api/group-forward-rules' + query)
+      },
+      create: (data: {
+        lineAccountId?: string | null
+        name: string
+        sourceGroupId: string
+        targetGroupId: string
+        approverUserId: string
+      }) =>
+        fetchApi<ApiResponse<GroupForwardRule>>('/api/group-forward-rules', {
+          method: 'POST',
+          body: JSON.stringify(data),
+        }),
+      update: (id: string, data: Partial<Pick<GroupForwardRule, 'name' | 'sourceGroupId' | 'targetGroupId' | 'approverUserId' | 'isActive'>> & { lineAccountId?: string | null }) =>
+        fetchApi<ApiResponse<GroupForwardRule>>(`/api/group-forward-rules/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify(data),
+        }),
+      delete: (id: string) =>
+        fetchApi<ApiResponse<null>>(`/api/group-forward-rules/${id}`, { method: 'DELETE' }),
+    },
+    requests: {
+      pending: (accountId?: string) => {
+        const params = new URLSearchParams({ status: 'pending' })
+        if (accountId) params.set('accountId', accountId)
+        return fetchApi<ApiResponse<GroupForwardRequest[]>>('/api/group-forward-requests?' + params.toString())
+      },
     },
   },
   notifications: {

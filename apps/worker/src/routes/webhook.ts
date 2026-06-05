@@ -18,7 +18,17 @@ import {
   addTagToFriend,
   getEntryRouteByRefCode,
   getMessageTemplateById,
+  getActiveGroupForwardRuleBySourceGroupId,
+  createGroupForwardRequest,
+  getPendingGroupForwardRequestForApprover,
+  approvePendingGroupForwardRequest,
+  markGroupForwardRequestForwarded,
+  rejectPendingGroupForwardRequest,
+  markGroupForwardRequestExpired,
+  markGroupForwardRequestFailed,
+  jstNow as nowInJst,
 } from '@line-crm/db';
+import type { GroupForwardRequestRow } from '@line-crm/db';
 import type { EntryRoute } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
@@ -123,7 +133,7 @@ webhook.post('/webhook', async (c) => {
   const processingPromise = (async () => {
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES);
+        await handleEvent(db, lineClient, event, body.destination, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -139,6 +149,7 @@ async function handleEvent(
   db: D1Database,
   lineClient: LineClient,
   event: WebhookEvent,
+  destination: string,
   lineAccessToken: string,
   lineAccountId: string | null = null,
   workerUrl?: string,
@@ -463,6 +474,14 @@ async function handleEvent(
 
   if (event.type === 'message' && event.message.type === 'text') {
     const textMessage = event.message as TextEventMessage;
+    const approvalHandled = await handleApprovalCommandIfAny(db, lineClient, event, textMessage);
+    if (approvalHandled) return;
+
+    if (event.source.type === 'group') {
+      await handleGroupForwardMessage(db, lineClient, event, textMessage, destination, lineAccountId);
+      return;
+    }
+
     const userId =
       event.source.type === 'user' ? event.source.userId : undefined;
     if (!userId) return;
@@ -637,6 +656,158 @@ async function resolveAutoReplyContent(
     }
   }
   return { messageType: rule.response_type, content: rule.response_content };
+}
+
+function parseApprovalCommand(text: string): { action: 'OK' | 'NG'; approvalCode: string } | null {
+  const match = text.trim().match(/^(OK|NG)\s+([A-Za-z0-9_-]+)$/i);
+  if (!match) return null;
+  return {
+    action: match[1].toUpperCase() as 'OK' | 'NG',
+    approvalCode: match[2].toUpperCase(),
+  };
+}
+
+function buildApprovalRequestText(request: GroupForwardRequestRow): string {
+  return [
+    '承認付きグループ転送の申請があります。',
+    '',
+    `申請ID：${request.approval_code}`,
+    `転送元グループ：${request.source_group_id}`,
+    `転送先グループ：${request.target_group_id}`,
+    `承認期限：${request.expires_at}`,
+    '',
+    request.message_text,
+    '',
+    `承認する場合: OK ${request.approval_code}`,
+    `破棄する場合: NG ${request.approval_code}`,
+  ].join('\n');
+}
+
+function buildForwardedGroupText(request: GroupForwardRequestRow): string {
+  return [
+    '【承認転送】',
+    `転送元グループ：${request.source_group_id}`,
+    `申請ID：${request.approval_code}`,
+    '',
+    request.message_text,
+  ].join('\n');
+}
+
+async function handleGroupForwardMessage(
+  db: D1Database,
+  lineClient: LineClient,
+  event: WebhookEvent,
+  textMessage: TextEventMessage,
+  destination: string,
+  lineAccountId: string | null,
+): Promise<void> {
+  if (event.type !== 'message' || event.source.type !== 'group') return;
+  const sourceGroupId = event.source.groupId;
+  const sourceUserId = event.source.userId ?? null;
+  if (sourceUserId && sourceUserId === destination) return;
+
+  const rule = await getActiveGroupForwardRuleBySourceGroupId(db, sourceGroupId, lineAccountId);
+  if (!rule) return;
+
+  const result = await createGroupForwardRequest(db, {
+    ruleId: rule.id,
+    lineAccountId,
+    sourceGroupId,
+    targetGroupId: rule.target_group_id,
+    approverUserId: rule.approver_user_id,
+    sourceUserId,
+    lineMessageId: textMessage.id,
+    messageText: textMessage.text,
+  });
+
+  if (result.status === 'duplicate') return;
+
+  try {
+    await lineClient.pushMessage(rule.approver_user_id, [
+      { type: 'text', text: buildApprovalRequestText(result.request) },
+    ]);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await markGroupForwardRequestFailed(db, result.request.id, reason);
+    console.error('Failed to push group forward approval request:', err);
+  }
+}
+
+async function handleApprovalCommandIfAny(
+  db: D1Database,
+  lineClient: LineClient,
+  event: WebhookEvent,
+  textMessage: TextEventMessage,
+): Promise<boolean> {
+  if (event.type !== 'message' || event.source.type !== 'user') return false;
+
+  const command = parseApprovalCommand(textMessage.text);
+  if (!command) return false;
+
+  const request = await getPendingGroupForwardRequestForApprover(
+    db,
+    event.source.userId,
+    command.approvalCode,
+  );
+
+  if (!request) {
+    await lineClient.replyMessage(event.replyToken, [
+      { type: 'text', text: '該当する承認待ち申請がありません。' },
+    ]);
+    return true;
+  }
+
+  const now = nowInJst();
+  if (new Date(request.expires_at).getTime() <= new Date(now).getTime()) {
+    await markGroupForwardRequestExpired(db, request.id, now);
+    await lineClient.replyMessage(event.replyToken, [
+      { type: 'text', text: `申請 ${request.approval_code} は承認期限切れです。` },
+    ]);
+    return true;
+  }
+
+  if (command.action === 'NG') {
+    const rejected = await rejectPendingGroupForwardRequest(db, request.id, now);
+    await lineClient.replyMessage(event.replyToken, [
+      {
+        type: 'text',
+        text: rejected
+          ? `申請 ${request.approval_code} を却下しました。`
+          : `申請 ${request.approval_code} はすでに処理済みです。`,
+      },
+    ]);
+    return true;
+  }
+
+  const approved = await approvePendingGroupForwardRequest(db, request.id, now);
+  if (!approved) {
+    await lineClient.replyMessage(event.replyToken, [
+      { type: 'text', text: `申請 ${request.approval_code} はすでに処理済みです。` },
+    ]);
+    return true;
+  }
+
+  try {
+    await lineClient.pushMessage(request.target_group_id, [
+      { type: 'text', text: buildForwardedGroupText(request) },
+    ]);
+    await markGroupForwardRequestForwarded(db, request.id, nowInJst());
+    await lineClient.replyMessage(event.replyToken, [
+      { type: 'text', text: `申請 ${request.approval_code} を承認し、転送しました。` },
+    ]);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await markGroupForwardRequestFailed(db, request.id, reason);
+    await lineClient.replyMessage(event.replyToken, [
+      {
+        type: 'text',
+        text: '転送に失敗しました。Botが転送先グループに参加しているか確認してください。',
+      },
+    ]);
+    console.error('Failed to forward approved group message:', err);
+  }
+
+  return true;
 }
 
 export { webhook };

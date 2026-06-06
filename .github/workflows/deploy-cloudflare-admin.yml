@@ -25,6 +25,7 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @line-crm/shared build
+      - run: pnpm --filter @line-harness/update-engine build
 
       - name: Build Admin Panel
         run: pnpm --filter web build
